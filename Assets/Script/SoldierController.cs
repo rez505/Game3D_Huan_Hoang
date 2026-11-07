@@ -54,15 +54,23 @@ public class SoldierController : MonoBehaviour
     [Tooltip("Nếu bấm chuột sớm một chút trong lúc đang chờ giữa 2 viên, " +
              "phát bắn sẽ được nhớ và ra ngay khi hết thời gian chờ (giúp bấm không bị mất).")]
     [SerializeField] private float singleClickBuffer = 0.25f;
+    [Tooltip("Bật: chế độ 2 có giới hạn đạn. Bắn hết đạn trong băng thì tự động nạp đạn, " +
+             "nạp xong mới bắn tiếp được. Chế độ 1 và 3 không bị giới hạn.")]
+    [SerializeField] private bool singleNeedsReload = true;
+    [Tooltip("Số viên trong một băng ở chế độ Single. 1 = bắn 1 viên là phải nạp lại.")]
+    [SerializeField] private int singleMagazineSize = 1;
+    [Tooltip("Sau viên bắn cuối của băng, chờ bao lâu rồi mới tự nạp đạn " +
+             "(để animation và tiếng bắn kịp chạy xong).")]
+    [SerializeField] private float singleReloadDelay = 0.4f;
 
     [Tooltip("Thời gian nghỉ giữa 2 loạt bắn ở chế độ Burst khi giữ chuột.")]
     [SerializeField] private float burstRepeatDelay = 0.25f;
     [SerializeField] private int burstBulletCount = 3;
     [SerializeField] private float burstInterval = 0.12f;
     [SerializeField] private float shootRange = 100f;
-    [Tooltip("Bật: đạn bay theo hướng mũi tên xanh (trục Z) của Muzzle Point. " +
-             "Tắt: đạn vẫn xuất phát từ nòng súng nhưng bay về điểm giữa màn hình (tâm ngắm).")]
-    [SerializeField] private bool shootAlongMuzzleForward = true;
+    [Tooltip("Bật: đạn xuất phát từ nòng súng nhưng bay về đúng điểm ở GIỮA MÀN HÌNH (tâm ngắm). " +
+             "Tắt: đạn bay thẳng theo hướng mũi tên xanh (trục Z) của Muzzle Point.")]
+    [SerializeField] private bool aimAtCrosshair = true;
     [SerializeField] private LayerMask hitLayers = ~0;
 
     [Header("Raise Weapon (đưa súng lên rồi mới ra đạn)")]
@@ -177,6 +185,9 @@ public class SoldierController : MonoBehaviour
     private float footstepTimer;
     private int lastFootstepIndex = -1;
 
+    private int singleAmmo;              // số đạn còn lại trong băng ở chế độ Single
+    private bool autoReloadPending;      // đang chờ một chút trước khi tự nạp đạn
+
     private AnimParam speedP, shootP, isShootingP, shootModeP, groundedP, aimingP;
     private AnimParam moveXP, moveYP, reloadP, dieP, jumpP;
 
@@ -188,6 +199,7 @@ public class SoldierController : MonoBehaviour
     {
         controller = GetComponent<CharacterController>();
         SetupAudio();
+        singleAmmo = Mathf.Max(1, singleMagazineSize);
 
         if (animator == null)
             animator = GetComponentInChildren<Animator>();
@@ -330,24 +342,55 @@ public class SoldierController : MonoBehaviour
 
     private void HandleReloadInput()
     {
-        if (KeyPressedThisFrame(KeyCode.R) && !isReloading && !isBurstFiring)
-        {
-            // Huỷ yêu cầu bắn đang chờ đưa súng lên.
-            isRaisingWeapon = false;
-            raiseTriggered = false;
-            pendingFire = false;
+        if (KeyPressedThisFrame(KeyCode.R))
+            StartReload();
+    }
 
-            FireTriggerP(reloadP);
-            PlayReloadSound();
-            StartCoroutine(ReloadRoutine());
-        }
+    // Bắt đầu nạp đạn (dùng cho cả bấm R và tự động nạp ở chế độ Single).
+    private void StartReload()
+    {
+        if (isDead || isReloading || isBurstFiring)
+            return;
+
+        // Huỷ yêu cầu bắn đang chờ đưa súng lên.
+        isRaisingWeapon = false;
+        raiseTriggered = false;
+        pendingFire = false;
+        singleClickBufferUntil = -1f;
+
+        FireTriggerP(reloadP);
+        PlayReloadSound();
+        StartCoroutine(ReloadRoutine());
     }
 
     private IEnumerator ReloadRoutine()
     {
         isReloading = true;
         yield return new WaitForSeconds(Mathf.Max(0.05f, reloadDuration));
+
+        // Nạp xong: đầy băng đạn chế độ Single.
+        singleAmmo = Mathf.Max(1, singleMagazineSize);
         isReloading = false;
+    }
+
+    // Chế độ 2 (Single) có giới hạn đạn không.
+    private bool UsesSingleAmmo()
+    {
+        return currentShootMode == 2 && singleNeedsReload;
+    }
+
+    // Chờ một chút cho animation và tiếng bắn chạy xong rồi tự nạp đạn.
+    private IEnumerator AutoReloadAfterShot()
+    {
+        autoReloadPending = true;
+        yield return new WaitForSeconds(Mathf.Max(0f, singleReloadDelay));
+        autoReloadPending = false;
+
+        if (singleAmmo <= 0)
+        {
+            Debug.Log("Single: hết đạn, tự động nạp đạn.");
+            StartReload();
+        }
     }
 
     private void HandleJumpInput()
@@ -365,6 +408,10 @@ public class SoldierController : MonoBehaviour
     private void HandleShootingInput()
     {
         if (isReloading || isBurstFiring)
+            return;
+
+        // Chế độ 2 hết đạn thì không bắn được, chờ tự nạp xong.
+        if (UsesSingleAmmo() && singleAmmo <= 0)
             return;
 
         // Auto luôn dùng "giữ chuột". Single/Burst dùng "giữ chuột" nếu bật holdToFireInAllModes,
@@ -525,6 +572,15 @@ public class SoldierController : MonoBehaviour
         pendingFire = false;
         singleClickBufferUntil = -1f;   // đã bắn, xoá cú bấm đang nhớ
 
+        // Chế độ Single: trừ 1 viên, hết đạn thì tự nạp.
+        if (UsesSingleAmmo())
+        {
+            singleAmmo = Mathf.Max(0, singleAmmo - 1);
+
+            if (singleAmmo <= 0 && !autoReloadPending)
+                StartCoroutine(AutoReloadAfterShot());
+        }
+
         // Cập nhật mode trước để Any State chọn đúng clip.
         SetIntP(shootModeP, currentShootMode);
 
@@ -559,26 +615,15 @@ public class SoldierController : MonoBehaviour
         Vector3 origin = muzzlePosition;
         Vector3 direction;
 
-        if (shootAlongMuzzleForward)
+        if (aimAtCrosshair)
         {
-            // Bay thẳng theo hướng nòng súng (trục Z của Muzzle Point).
-            direction = muzzlePoint != null ? muzzlePoint.forward : transform.forward;
+            // Bắn từ nòng súng nhưng bay về điểm giữa màn hình (tâm ngắm).
+            direction = GetCrosshairDirection(origin);
         }
         else
         {
-            // Vẫn bắn từ nòng súng nhưng hướng về điểm giữa màn hình (tâm ngắm).
-            Vector3 aimPoint = origin + transform.forward * shootRange;
-            Transform cam = GetCamera();
-
-            if (cam != null)
-            {
-                aimPoint = cam.position + cam.forward * shootRange;
-
-                if (RaycastIgnoreSelf(cam.position, cam.forward, out RaycastHit camHit))
-                    aimPoint = camHit.point;
-            }
-
-            direction = (aimPoint - origin).normalized;
+            // Bay thẳng theo hướng nòng súng (trục Z của Muzzle Point).
+            direction = muzzlePoint != null ? muzzlePoint.forward : transform.forward;
         }
 
         Vector3 targetPoint = origin + direction * shootRange;
@@ -599,6 +644,34 @@ public class SoldierController : MonoBehaviour
 
         if (bulletTracerPrefab != null)
             StartCoroutine(SpawnBulletTracer(muzzlePosition, targetPoint));
+    }
+
+    // Tính hướng bắn từ nòng súng (origin) tới điểm mà tâm ngắm (giữa màn hình) đang chỉ vào.
+    private Vector3 GetCrosshairDirection(Vector3 origin)
+    {
+        Vector3 fallback = muzzlePoint != null ? muzzlePoint.forward : transform.forward;
+        Transform cam = GetCamera();
+
+        if (cam == null)
+            return fallback;
+
+        // Tia từ tâm màn hình. Bắt đầu tia ở mặt phẳng ngang với nòng súng (không phải ngay tại camera)
+        // để không trúng vật nằm giữa camera và nhân vật.
+        float along = Mathf.Max(0f, Vector3.Dot(origin - cam.position, cam.forward));
+        Vector3 rayStart = cam.position + cam.forward * along;
+
+        Vector3 aimPoint = rayStart + cam.forward * shootRange;
+
+        if (RaycastIgnoreSelf(rayStart, cam.forward, out RaycastHit camHit))
+            aimPoint = camHit.point;
+
+        Vector3 toAim = aimPoint - origin;
+
+        // Điểm ngắm quá sát hoặc nằm sau nòng súng thì bắn thẳng theo hướng camera.
+        if (toAim.sqrMagnitude < 0.01f || Vector3.Dot(toAim, cam.forward) <= 0f)
+            return cam.forward;
+
+        return toAim.normalized;
     }
 
     // Phát hiệu ứng tia lửa tại đầu súng.
