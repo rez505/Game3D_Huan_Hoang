@@ -1,52 +1,52 @@
+using Fusion;
 using UnityEngine;
 
+// Prefab enemy cần có: NetworkObject, NetworkTransform, CharacterController, EnemyController (+ Animator ở object con).
+// KHÔNG thêm NetworkMecanimAnimator (script này tự đồng bộ animation).
 [RequireComponent(typeof(CharacterController))]
-public class EnemyController : MonoBehaviour
+public class EnemyController : NetworkBehaviour
 {
     [Header("References")]
     [SerializeField] private Animator animator;
-    [Tooltip("Mục tiêu để đuổi theo. Để trống thì script tự tìm GameObject có tag 'Player'.")]
+    [Tooltip("Để trống thì script tự tìm player gần nhất có tag 'Player'.")]
     [SerializeField] private Transform target;
 
-    [Header("Detection (phát hiện player)")]
-    [Tooltip("Player lại gần trong khoảng cách này thì enemy bắt đầu đuổi.")]
+    [Header("Detection")]
     [SerializeField] private float detectRange = 12f;
-    [Tooltip("Đang đuổi mà player chạy xa hơn khoảng cách này thì enemy bỏ cuộc và đứng lại. " +
-             "Nên lớn hơn Detect Range để enemy không bị chập chờn đuổi/dừng liên tục.")]
+    [Tooltip("Nên lớn hơn Detect Range để enemy không chập chờn đuổi/dừng.")]
     [SerializeField] private float loseRange = 18f;
+    [Tooltip("Bao lâu thì tìm lại player gần nhất (giây).")]
+    [SerializeField] private float retargetInterval = 0.5f;
 
     [Header("Movement")]
     [SerializeField] private float chaseSpeed = 3.5f;
     [SerializeField] private float rotationSpeed = 8f;
-    [Tooltip("Dừng lại khi cách player khoảng này (để không đâm vào người player).")]
     [SerializeField] private float stopDistance = 1.5f;
     [SerializeField] private float gravity = -20f;
 
-    [Header("Attack (tuỳ chọn)")]
-    [Tooltip("Khoảng cách để kích hoạt animation tấn công. Đặt 0 để tắt. " +
-             "Nên lớn hơn Stop Distance một chút (ví dụ 2).")]
+    [Header("Attack")]
+    [Tooltip("Đặt 0 để tắt tấn công. Nên lớn hơn Stop Distance một chút.")]
     [SerializeField] private float attackRange = 2f;
-    [Tooltip("Thời gian nghỉ SAU KHI đánh xong rồi mới được đánh tiếp (giây).")]
     [SerializeField] private float attackCooldown = 0.5f;
-    [Tooltip("Thời gian enemy đứng yên khi tấn công, bằng độ dài clip tấn công (giây). " +
-             "Hết thời gian này enemy mới được di chuyển tiếp. " +
-             "Xem độ dài clip: chọn clip trong Project, thanh thời gian ở khung Preview.")]
+    [Tooltip("Thời gian đứng yên khi đánh, bằng độ dài clip tấn công (giây).")]
     [SerializeField] private float attackDuration = 1f;
-    [Tooltip("Bật: enemy vẫn xoay theo player khi đang đánh. Tắt: đứng yên hoàn toàn đến hết animation.")]
     [SerializeField] private bool rotateWhileAttacking = false;
 
     [Header("Animator Parameters")]
-    [Tooltip("Float 0..1: 0 = đứng (Idle), 1 = đang chạy đuổi. Dùng để chuyển Idle <-> Run/Walk.")]
     [SerializeField] private string speedParameter = "Speed";
-    [Tooltip("Bool (tuỳ chọn): true khi đang đuổi theo player.")]
     [SerializeField] private string isChasingParameter = "IsChasing";
-    [Tooltip("Trigger (tuỳ chọn): kích hoạt khi tấn công.")]
     [SerializeField] private string attackParameter = "Attack";
-    [Tooltip("Trigger (tuỳ chọn): kích hoạt khi chết.")]
     [SerializeField] private string dieParameter = "Die";
 
     [Header("Debug")]
     [SerializeField] private bool logAnimatorParameters = true;
+
+    // ---------------------------------------------------------------- Networked state
+    // Chỉ máy có State Authority ghi, mọi máy đọc để chạy animation.
+    [Networked] public NetworkBool IsChasing { get; set; }
+    [Networked] public NetworkBool IsMoving { get; set; }
+    [Networked] public NetworkBool IsDead { get; set; }
+    [Networked] public int AttackCount { get; set; }
 
     private struct AnimParam
     {
@@ -57,15 +57,21 @@ public class EnemyController : MonoBehaviour
 
     private CharacterController controller;
     private Vector3 verticalVelocity;
+    private bool ready;
 
-    private bool isChasing;
-    private bool isDead;
-    private bool isAttacking;     // đang trong animation tấn công, đứng yên không di chuyển
-    private float attackEndTime;  // thời điểm animation tấn công kết thúc
+    // Chỉ dùng trên máy authority
+    private bool isAttacking;
+    private float attackEndTime;
     private float nextAttackTime;
     private float targetSearchTimer;
 
+    // Chỉ dùng cho hiển thị (mọi máy)
+    private int shownAttackCount;
+    private bool deathShown;
+
     private AnimParam speedP, chasingP, attackP, dieP;
+
+    // ---------------------------------------------------------------- Setup
 
     private void Awake()
     {
@@ -77,18 +83,15 @@ public class EnemyController : MonoBehaviour
         if (animator == null)
         {
             Debug.LogError("EnemyController: Không tìm thấy Animator trong enemy.", this);
-            enabled = false;
             return;
         }
 
         if (animator.runtimeAnimatorController == null)
         {
             Debug.LogError("EnemyController: Animator chưa được gán Controller!", this);
-            enabled = false;
             return;
         }
 
-        // Enemy di chuyển bằng CharacterController nên không dùng Root Motion.
         animator.applyRootMotion = false;
 
         speedP = FindParam(speedParameter);
@@ -103,158 +106,220 @@ public class EnemyController : MonoBehaviour
             CheckParam(attackP, attackParameter, AnimatorControllerParameterType.Trigger);
             CheckParam(dieP, dieParameter, AnimatorControllerParameterType.Trigger);
         }
+
+        ready = true;
     }
 
-    private void Start()
+    public override void Spawned()
     {
-        FindTarget();
+        // Người vào sau không bị phát lại animation đánh cũ.
+        shownAttackCount = AttackCount;
 
-        if (target == null)
-            Debug.LogWarning("EnemyController: Chưa có mục tiêu. Hãy gán Target hoặc gắn tag 'Player' cho nhân vật.", this);
+        // Nếu vào phòng khi enemy đã chết thì hiện luôn trạng thái chết.
+        if (IsDead)
+            ApplyDeathVisual();
+
+        UpdateControllerAuthority();
     }
 
-    private void Update()
-    {
-        if (isDead)
-            return;
+    // ---------------------------------------------------------------- Logic (chỉ máy authority)
 
-        // Nếu chưa có target (ví dụ player spawn sau) thì thử tìm lại mỗi 1 giây.
-        if (target == null)
+    public override void FixedUpdateNetwork()
+    {
+        if (!ready) return;
+
+        // Quyền có thể chuyển sang máy khác nếu người giữ quyền thoát phòng.
+        UpdateControllerAuthority();
+
+        if (!HasStateAuthority) return;
+        if (IsDead) return;
+
+        float dt = Runner.DeltaTime;
+        float now = Runner.SimulationTime;
+
+        // Tìm player gần nhất định kỳ (hoặc ngay khi mất target).
+        targetSearchTimer -= dt;
+        if (target == null || targetSearchTimer <= 0f)
         {
-            targetSearchTimer -= Time.deltaTime;
-            if (targetSearchTimer <= 0f)
-            {
-                targetSearchTimer = 1f;
-                FindTarget();
-            }
+            targetSearchTimer = retargetInterval;
+            FindNearestTarget();
         }
 
         Vector3 horizontalMove = Vector3.zero;
-        bool isMoving = false;
+        bool moving = false;
 
         if (target != null)
         {
-            // Khoảng cách và hướng tới player, chỉ tính trên mặt phẳng ngang.
             Vector3 toTarget = target.position - transform.position;
             toTarget.y = 0f;
             float distance = toTarget.magnitude;
 
             UpdateChaseState(distance);
 
-            // Hết thời gian animation tấn công thì mới cho di chuyển tiếp.
-            if (isAttacking && Time.time >= attackEndTime)
+            if (isAttacking && now >= attackEndTime)
                 isAttacking = false;
 
-            if (isChasing && distance > 0.001f)
+            if (IsChasing && distance > 0.001f)
             {
                 Vector3 direction = toTarget / distance;
 
-                // Xoay mặt về phía player (khi đang đánh thì chỉ xoay nếu bật rotateWhileAttacking).
                 if (!isAttacking || rotateWhileAttacking)
                 {
                     Quaternion targetRotation = Quaternion.LookRotation(direction);
                     transform.rotation = Quaternion.Slerp(
-                        transform.rotation,
-                        targetRotation,
-                        rotationSpeed * Time.deltaTime);
+                        transform.rotation, targetRotation, rotationSpeed * dt);
                 }
 
-                // Thử đánh trước: nếu bắt đầu đánh thì đứng lại ngay từ frame này.
                 if (!isAttacking)
-                    TryAttack(distance);
+                    TryAttack(distance, now);
 
-                // Chưa tới gần thì chạy tới, tới gần rồi hoặc đang đánh thì đứng lại.
                 if (!isAttacking && distance > stopDistance)
                 {
                     horizontalMove = direction * chaseSpeed;
-                    isMoving = true;
+                    moving = true;
                 }
             }
         }
         else
         {
-            isChasing = false;
+            IsChasing = false;
         }
 
-        // Trọng lực.
+        // Trọng lực + di chuyển
         if (controller.isGrounded && verticalVelocity.y < 0f)
             verticalVelocity.y = -2f;
 
-        verticalVelocity.y += gravity * Time.deltaTime;
+        verticalVelocity.y += gravity * dt;
 
         Vector3 movement = horizontalMove;
         movement.y = verticalVelocity.y;
-        controller.Move(movement * Time.deltaTime);
+        controller.Move(movement * dt);
 
-        // Cập nhật Animator.
-        SetFloatP(speedP, isMoving ? 1f : 0f);
-        SetBoolP(chasingP, isChasing);
+        IsMoving = moving;
     }
 
-    // Có hysteresis: vào tầm Detect thì đuổi, ra khỏi tầm Lose mới bỏ.
     private void UpdateChaseState(float distance)
     {
-        if (!isChasing && distance <= detectRange)
-            isChasing = true;
-        else if (isChasing && distance > loseRange)
-            isChasing = false;
+        if (!IsChasing && distance <= detectRange)
+            IsChasing = true;
+        else if (IsChasing && distance > loseRange)
+            IsChasing = false;
     }
 
-    private void TryAttack(float distance)
+    private void TryAttack(float distance, float now)
     {
-        if (attackRange <= 0f || distance > attackRange)
-            return;
+        if (attackRange <= 0f || distance > attackRange) return;
+        if (now < nextAttackTime) return;
 
-        if (Time.time < nextAttackTime)
-            return;
-
-        // Bắt đầu đánh: đứng yên đến hết animation, cooldown tính từ lúc đánh xong.
         isAttacking = true;
-        attackEndTime = Time.time + Mathf.Max(0.05f, attackDuration);
+        attackEndTime = now + Mathf.Max(0.05f, attackDuration);
         nextAttackTime = attackEndTime + Mathf.Max(0f, attackCooldown);
 
-        FireTriggerP(attackP);
+        // Tăng biến này -> mọi máy thấy thay đổi và chạy animation đánh.
+        AttackCount++;
 
-        // TODO: gây sát thương cho player ở đây (gọi hàm trừ máu của player).
+        // TODO: gây sát thương cho player ở đây.
+        // Vì player là object của máy khác, nên gửi RPC tới player đó để trừ máu
+        // (ví dụ: targetPlayer.RPC_TakeDamage(10)).
         Debug.Log(name + " tấn công player!");
     }
 
-    private void FindTarget()
+    private void FindNearestTarget()
     {
-        if (target != null)
-            return;
-
-        GameObject player = null;
-
+        GameObject[] players;
         try
         {
-            player = GameObject.FindGameObjectWithTag("Player");
+            players = GameObject.FindGameObjectsWithTag("Player");
         }
         catch (UnityException)
         {
-            // Tag 'Player' chưa tồn tại trong project, bỏ qua.
+            return; // Tag 'Player' chưa tồn tại trong project.
         }
 
-        if (player != null)
-            target = player.transform;
+        Transform nearest = null;
+        float best = float.MaxValue;
+
+        foreach (GameObject p in players)
+        {
+            float d = (p.transform.position - transform.position).sqrMagnitude;
+            if (d < best)
+            {
+                best = d;
+                nearest = p.transform;
+            }
+        }
+
+        target = nearest;
     }
 
-    // Gọi hàm này từ hệ thống máu khi HP của enemy về 0.
+    // Bật CharacterController chỉ trên máy authority.
+    // Máy khác để NetworkTransform tự đặt vị trí, tránh CharacterController giành quyền.
+    private void UpdateControllerAuthority()
+    {
+        bool shouldEnable = HasStateAuthority && !IsDead;
+        if (controller.enabled != shouldEnable)
+            controller.enabled = shouldEnable;
+    }
+
+    // ---------------------------------------------------------------- Chết
+
+    // Gọi từ bất kỳ máy nào (ví dụ khi đạn/đòn đánh của player trúng enemy).
     public void Die()
     {
-        if (isDead)
-            return;
+        if (HasStateAuthority)
+            DoDie();
+        else
+            RPC_Die();
+    }
 
-        isDead = true;
-        isChasing = false;
+    [Rpc(RpcSources.All, RpcTargets.StateAuthority)]
+    private void RPC_Die()
+    {
+        DoDie();
+    }
+
+    private void DoDie()
+    {
+        if (IsDead) return;
+
+        IsDead = true;
+        IsChasing = false;
+        IsMoving = false;
         isAttacking = false;
+        controller.enabled = false;
+    }
 
+    // ---------------------------------------------------------------- Hiển thị (mọi máy)
+
+    public override void Render()
+    {
+        if (!ready) return;
+
+        // Animation chết
+        if (IsDead)
+        {
+            if (!deathShown)
+                ApplyDeathVisual();
+            return;
+        }
+
+        // Animation đánh: so sánh số lần đánh đã hiện với số lần trên mạng.
+        if (AttackCount != shownAttackCount)
+        {
+            shownAttackCount = AttackCount;
+            FireTriggerP(attackP);
+        }
+
+        SetFloatP(speedP, IsMoving ? 1f : 0f);
+        SetBoolP(chasingP, IsChasing);
+    }
+
+    private void ApplyDeathVisual()
+    {
+        deathShown = true;
         FireTriggerP(dieP);
         SetFloatP(speedP, 0f, false);
         SetBoolP(chasingP, false);
-
-        // Tắt CharacterController để xác không chặn đường player.
-        controller.enabled = false;
     }
 
     // ---------------------------------------------------------------- Gizmos
@@ -302,7 +367,6 @@ public class EnemyController : MonoBehaviour
                              " nhưng nên là " + expected + ".", this);
     }
 
-    // Float: chấp nhận Float / Int / Bool.
     private void SetFloatP(AnimParam p, float value, bool damp = true)
     {
         if (!p.exists) return;
@@ -322,7 +386,6 @@ public class EnemyController : MonoBehaviour
         }
     }
 
-    // Bool: chấp nhận Bool / Float / Int.
     private void SetBoolP(AnimParam p, bool value)
     {
         if (!p.exists) return;
@@ -341,7 +404,6 @@ public class EnemyController : MonoBehaviour
         }
     }
 
-    // Trigger: bắt buộc phải là kiểu Trigger trong Animator.
     private void FireTriggerP(AnimParam p)
     {
         if (!p.exists || p.type != AnimatorControllerParameterType.Trigger)

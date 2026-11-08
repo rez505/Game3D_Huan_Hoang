@@ -1,15 +1,26 @@
 using System.Collections;
+using Fusion;
 using UnityEngine;
 
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 #endif
 
+// BẢN MULTIPLAYER (Photon Fusion 2 - Shared Mode)
+// - Người chơi nào có State Authority thì chạy input, di chuyển, bắn.
+// - Người chơi khác (proxy) nhận vị trí qua [Networked] NetPosition/NetYaw (script tự làm mượt),
+//   animation qua NetworkMecanimAnimator và hiệu ứng bắn/âm thanh qua RPC.
+//
+// Prefab người chơi cần có: NetworkObject, NetworkMecanimAnimator, CharacterController,
+// Animator và script này.
+// KHÔNG gắn NetworkTransform / NetworkCharacterController (sẽ ghi đè vị trí và gây giật).
 [RequireComponent(typeof(CharacterController))]
-public class SoldierController : MonoBehaviour
+public class SoldierController : NetworkBehaviour
 {
     [Header("References")]
     [SerializeField] private Animator animator;
+    [Tooltip("Component NetworkMecanimAnimator trên prefab (dùng để đồng bộ animation). Để trống thì tự tìm.")]
+    [SerializeField] private NetworkMecanimAnimator networkAnimator;
     [SerializeField] private Transform cameraTransform;
     [SerializeField] private Transform muzzlePoint;
 
@@ -23,6 +34,16 @@ public class SoldierController : MonoBehaviour
     [SerializeField] private bool stopMovingWhileShooting = true;
     [Tooltip("Đứng yên thêm một chút sau mỗi phát bắn (giúp bắn lẻ cũng đứng lại).")]
     [SerializeField] private float standStillAfterShot = 0.15f;
+
+    [Header("Jump (khớp với animation nhảy)")]
+    [Tooltip("Từ lúc bấm Space đến lúc nhân vật thật sự rời khỏi mặt đất (giây). " +
+             "Bằng thời gian animation 'nhún chân chuẩn bị'. Nhảy bị quá sớm so với animation thì tăng giá trị này. " +
+             "0 = nhảy ngay.")]
+    [SerializeField] private float jumpTakeoffDelay = 0.15f;
+    [Tooltip("Tổng thời gian nhân vật ở trên không (giây), từ lúc rời đất đến lúc chạm đất. " +
+             "Đặt gần bằng phần 'bay trên không' của animation nhảy. Nhảy nhanh hơn animation thì tăng giá trị này " +
+             "(nhảy chậm, lơ lửng hơn). Chiều cao vẫn theo Jump Height. 0 = dùng Gravity như cũ.")]
+    [SerializeField] private float jumpAirTime = 1.0f;
 
     [Header("Animator Parameters")]
     [SerializeField] private string speedParameter = "Speed";
@@ -96,6 +117,9 @@ public class SoldierController : MonoBehaviour
     [Tooltip("AudioSource dùng riêng cho tiếng nạp đạn (tách riêng để bước chân không làm lệch cao độ). " +
              "Để trống thì script tự tạo.")]
     [SerializeField] private AudioSource reloadAudioSource;
+    [Tooltip("Người chơi KHÁC sẽ nghe theo kiểu 3D (xa thì nhỏ). Đây là khoảng cách bắt đầu nhỏ dần / nghe không thấy.")]
+    [SerializeField] private float remoteAudioMinDistance = 3f;
+    [SerializeField] private float remoteAudioMaxDistance = 40f;
 
     [Header("Audio - Tiếng súng (mỗi chế độ một âm thanh)")]
     [Tooltip("Chế độ 1: AUTO (bắn liên thanh, nên chọn clip ngắn).")]
@@ -141,7 +165,7 @@ public class SoldierController : MonoBehaviour
     [SerializeField] private float bulletLifeTime = 0.08f;
 
     [Header("Muzzle Flash (tia lửa đầu súng)")]
-    [Tooltip("Hiệu ứng có sẵn trong Scene (đặt làm con của súng hoặc Muzzle Point). " +
+    [Tooltip("Hiệu ứng có sẵn trong Prefab (đặt làm con của súng hoặc Muzzle Point). " +
              "Sẽ được Play lại mỗi phát bắn. Để trống thì script tự tìm trong Muzzle Point.")]
     [SerializeField] private ParticleSystem muzzleFlash;
     [Tooltip("Hoặc kéo Prefab hiệu ứng vào đây: sẽ được tạo ra tại đầu súng mỗi phát bắn.")]
@@ -152,6 +176,57 @@ public class SoldierController : MonoBehaviour
     [Header("Debug")]
     [SerializeField] private bool logAnimatorParameters = true;
 
+    // ---------------------------------------------------------------- Networked state
+    // Dùng để máy khác phát đúng tiếng bước chân của người chơi này.
+    [Networked] private NetworkBool NetIsMoving { get; set; }
+    [Networked] private NetworkBool NetIsRunning { get; set; }
+    [Networked] private NetworkBool NetIsGrounded { get; set; }
+
+    // Giá trị cục bộ, được ghi vào Networked trong FixedUpdateNetwork.
+    private bool localMoving;
+    private bool localRunning;
+    private bool localGrounded;
+
+    private bool spawned;
+
+    // Đồng bộ vị trí tự làm (không dùng NetworkTransform / NetworkCharacterController):
+    // - Máy sở hữu nhân vật tự di chuyển mượt ở mỗi frame, rồi ghi vị trí + hướng xoay lên mạng.
+    // - Máy khác đọc 2 giá trị này và làm mượt dần nhân vật về đó.
+    [Networked] private Vector3 NetPosition { get; set; }
+    [Networked] private float NetYaw { get; set; }
+    [Networked] private Vector3 NetVelocity { get; set; }
+
+    [Header("Network Interpolation (nhân vật người khác)")]
+    [Tooltip("Độ trễ cố ý (giây) để nội suy giữa các gói vị trí: nhân vật người khác di chuyển ĐỀU và " +
+             "cùng tốc độ với máy gốc. Nhỏ = ít trễ nhưng dễ giật khi mạng không ổn định. " +
+             "Gợi ý: 0.06 - 0.12 (khoảng 2 tick). 0 = đặt thẳng tới vị trí mới nhất.")]
+    [SerializeField] private float proxyInterpolationDelay = 0.08f;
+    [Tooltip("Khi gói tin trễ, cho phép đoán trước tối đa chừng này giây theo vận tốc. 0 = tắt.")]
+    [SerializeField] private float proxyMaxExtrapolation = 0.1f;
+    private Vector3 lastNetPosition;
+    [Tooltip("Lệch xa hơn khoảng này (mét) thì dịch chuyển tức thì thay vì trượt (ví dụ khi respawn).")]
+    [SerializeField] private float proxyTeleportDistance = 5f;
+
+    // Bộ đệm các mẫu vị trí nhận từ mạng, dùng để nội suy.
+    private struct NetSample
+    {
+        public float time;
+        public Vector3 position;
+        public float yaw;
+    }
+    private readonly System.Collections.Generic.List<NetSample> netSamples =
+        new System.Collections.Generic.List<NetSample>(32);
+    private bool hasLastRawSample;
+    private Vector3 lastRawPosition;
+    private float lastRawYaw;
+    private Vector3 verticalVelocity;
+
+    // Trạng thái nhảy.
+    private bool jumpPending;        // đã bấm nhảy, đang chờ nhún chân xong
+    private float jumpTakeoffTime;   // thời điểm rời khỏi mặt đất
+    private bool inJump;             // đang ở trên không do nhảy
+    private float jumpStartTime;
+
     // Lưu thông tin 1 parameter của Animator: có tồn tại không và kiểu gì.
     private struct AnimParam
     {
@@ -161,7 +236,6 @@ public class SoldierController : MonoBehaviour
     }
 
     private CharacterController controller;
-    private Vector3 verticalVelocity;
 
     // 1 = Auto, 2 = Single, 3 = Burst
     private int currentShootMode;
@@ -195,14 +269,33 @@ public class SoldierController : MonoBehaviour
     private bool UsesShootingBool =>
         isShootingP.exists && isShootingP.type == AnimatorControllerParameterType.Bool;
 
+    // ---------------------------------------------------------------- Unity / Fusion lifecycle
+
     private void Awake()
     {
         controller = GetComponent<CharacterController>();
+
+        if (GetComponent<NetworkTransform>() != null)
+            Debug.LogWarning("SoldierController: Prefab đang có NetworkTransform / NetworkCharacterController. " +
+                             "Hãy XOÁ nó khỏi prefab, script này tự đồng bộ vị trí.");
+
+        // Rigidbody (không kinematic) đánh nhau với CharacterController làm nhân vật đứng yên.
+        Rigidbody rb = GetComponent<Rigidbody>();
+        if (rb != null)
+        {
+            rb.isKinematic = true;
+            Debug.LogWarning("SoldierController: Prefab có Rigidbody, đã tự đặt Is Kinematic = true. " +
+                             "Nên xoá Rigidbody khỏi prefab (CharacterController không cần).");
+        }
+
         SetupAudio();
         singleAmmo = Mathf.Max(1, singleMagazineSize);
 
         if (animator == null)
             animator = GetComponentInChildren<Animator>();
+
+        if (networkAnimator == null)
+            networkAnimator = GetComponentInChildren<NetworkMecanimAnimator>();
 
         if (animator == null)
         {
@@ -218,6 +311,10 @@ public class SoldierController : MonoBehaviour
             enabled = false;
             return;
         }
+
+        if (networkAnimator == null)
+            Debug.LogWarning("SoldierController: Prefab chưa có NetworkMecanimAnimator. " +
+                             "Animation sẽ KHÔNG hiện bên máy người chơi khác!");
 
         // Nhân vật di chuyển bằng CharacterController nên không dùng Root Motion.
         animator.applyRootMotion = false;
@@ -256,34 +353,109 @@ public class SoldierController : MonoBehaviour
         }
 
         currentShootMode = Mathf.Clamp(startingShootMode, 1, 3);
-        SetIntP(shootModeP, currentShootMode);
     }
 
     private void Start()
     {
-        GetCamera();
-
-        if (cameraTransform == null)
-            Debug.LogWarning("SoldierController: Chưa có Camera. Hãy gán Camera Transform hoặc gắn tag " +
-                             "'MainCamera' cho camera. Tạm thời nhân vật sẽ di chuyển theo hướng của chính nó.");
-
-        if (muzzlePoint == null)
-            Debug.LogWarning("Chưa gán Muzzle Point. Tia đạn sẽ lấy vị trí dự phòng phía trước nhân vật.");
+        if (bulletTracerPrefab == null)
+            Debug.LogWarning("Chưa gán Bullet Tracer Prefab. Nhân vật vẫn bắn Raycast nhưng không hiện tia đạn.");
 
         // Nếu chưa gán hiệu ứng nhưng đã đặt sẵn trong Muzzle Point thì tự tìm.
         if (muzzleFlash == null && muzzleFlashPrefab == null && muzzlePoint != null)
             muzzleFlash = muzzlePoint.GetComponentInChildren<ParticleSystem>();
+    }
 
-        if (bulletTracerPrefab == null)
-            Debug.LogWarning("Chưa gán Bullet Tracer Prefab. Nhân vật vẫn bắn Raycast nhưng không hiện tia đạn.");
+    // Gọi khi nhân vật được spawn trên mạng (cả máy mình và máy người khác).
+    public override void Spawned()
+    {
+        spawned = true;
+
+        // Người chơi của mình: 3D = 0 (nghe rõ). Người chơi khác: 3D = 1 (nghe theo khoảng cách).
+        ConfigureAudioSpatial(!HasStateAuthority);
+
+        if (HasStateAuthority)
+        {
+            // Đây là nhân vật CỦA MÌNH.
+            controller.enabled = true;
+
+            // Ghi vị trí ban đầu để máy khác thấy nhân vật đúng chỗ ngay khi spawn.
+            NetPosition = transform.position;
+            NetYaw = transform.eulerAngles.y;
+            NetVelocity = Vector3.zero;
+            lastNetPosition = transform.position;
+
+            SetIntP(shootModeP, currentShootMode);
+
+            if (muzzlePoint == null)
+                Debug.LogWarning("Chưa gán Muzzle Point. Tia đạn sẽ lấy vị trí dự phòng phía trước nhân vật.");
+
+            // Gắn camera trong scene vào nhân vật của mình.
+            Camera mainCam = Camera.main;
+            if (mainCam != null)
+            {
+                cameraTransform = mainCam.transform;
+
+                ThirdPersonShooterCamera shooterCam = mainCam.GetComponent<ThirdPersonShooterCamera>();
+                if (shooterCam != null)
+                    shooterCam.SetTarget(transform);
+                else
+                    Debug.LogWarning("Main Camera chưa có ThirdPersonShooterCamera.");
+            }
+            else
+            {
+                Debug.LogWarning("SoldierController: Không có camera tag 'MainCamera' trong scene Gameplay.");
+            }
+        }
+        else
+        {
+            // Nhân vật của người khác: tắt CharacterController để script tự đặt vị trí được,
+            // và đặt ngay về chỗ đang đứng (nếu đã có dữ liệu).
+            controller.enabled = false;
+
+            ResetProxyBuffer(NetPosition, NetYaw);
+        }
+    }
+
+    // Ghi vị trí + trạng thái cần đồng bộ (chỉ máy sở hữu nhân vật mới được ghi).
+    public override void FixedUpdateNetwork()
+    {
+        if (!HasStateAuthority)
+            return;
+
+        Vector3 currentPosition = transform.position;
+
+        // Vận tốc ngang (bỏ trục Y) để máy khác đoán trước vị trí.
+        float dt = Runner.DeltaTime;
+        Vector3 velocity = dt > 0f ? (currentPosition - lastNetPosition) / dt : Vector3.zero;
+        velocity.y = 0f;
+        lastNetPosition = currentPosition;
+
+        NetPosition = currentPosition;
+        NetYaw = transform.eulerAngles.y;
+        NetVelocity = velocity;
+
+        NetIsMoving = localMoving;
+        NetIsRunning = localRunning;
+        NetIsGrounded = localGrounded;
     }
 
     private void Update()
     {
+        if (!spawned)
+            return;
+
+        // Người chơi khác: làm mượt vị trí và phát tiếng bước chân theo dữ liệu mạng.
+        if (!HasStateAuthority)
+        {
+            UpdateProxyTransform();
+            HandleFootsteps(NetIsMoving, NetIsRunning, NetIsGrounded);
+            return;
+        }
+
         if (isDead)
             return;
 
-        // KHÔNG return khi thiếu camera nữa, để animation/di chuyển vẫn chạy.
+        // KHÔNG return khi thiếu camera, để animation/di chuyển vẫn chạy.
         HandleShootModeInput();
         HandleAimInput();
         HandleReloadInput();
@@ -291,6 +463,99 @@ public class SoldierController : MonoBehaviour
         HandleShootingInput();
         UpdateShootingAnimBool();
         MovePlayer();
+    }
+
+    // Xoá bộ đệm và đặt nhân vật người khác thẳng vào vị trí cho trước.
+    private void ResetProxyBuffer(Vector3 position, float yaw)
+    {
+        netSamples.Clear();
+        netSamples.Add(new NetSample { time = Time.time - 1f, position = position, yaw = yaw });
+        hasLastRawSample = true;
+        lastRawPosition = position;
+        lastRawYaw = yaw;
+        transform.SetPositionAndRotation(position, Quaternion.Euler(0f, yaw, 0f));
+    }
+
+    // Nội suy vị trí / hướng xoay của nhân vật người khác từ các mẫu nhận được.
+    // Hiển thị chậm hơn thực tế một chút (proxyInterpolationDelay) để chuyển động luôn đều.
+    private void UpdateProxyTransform()
+    {
+        Vector3 rawPosition = NetPosition;
+        float rawYaw = NetYaw;
+
+        // Có dữ liệu mới thì thêm vào bộ đệm.
+        if (!hasLastRawSample || rawPosition != lastRawPosition || !Mathf.Approximately(rawYaw, lastRawYaw))
+        {
+            float teleportSqr = proxyTeleportDistance * proxyTeleportDistance;
+
+            if (hasLastRawSample && (rawPosition - lastRawPosition).sqrMagnitude > teleportSqr)
+            {
+                // Dịch chuyển xa (ví dụ respawn): đặt thẳng, không trượt.
+                ResetProxyBuffer(rawPosition, rawYaw);
+            }
+            else
+            {
+                netSamples.Add(new NetSample { time = Time.time, position = rawPosition, yaw = rawYaw });
+
+                // Giữ bộ đệm gọn.
+                if (netSamples.Count > 32)
+                    netSamples.RemoveRange(0, netSamples.Count - 32);
+            }
+
+            hasLastRawSample = true;
+            lastRawPosition = rawPosition;
+            lastRawYaw = rawYaw;
+        }
+
+        if (netSamples.Count == 0)
+            return;
+
+        float renderTime = Time.time - Mathf.Max(0f, proxyInterpolationDelay);
+
+        // Bỏ các mẫu quá cũ (giữ lại 1 mẫu trước renderTime để nội suy).
+        while (netSamples.Count > 2 && netSamples[1].time <= renderTime)
+            netSamples.RemoveAt(0);
+
+        Vector3 position;
+        float yaw;
+
+        NetSample first = netSamples[0];
+        NetSample last = netSamples[netSamples.Count - 1];
+
+        if (proxyInterpolationDelay <= 0f || netSamples.Count == 1 || renderTime <= first.time)
+        {
+            // Không có đủ dữ liệu để nội suy: dùng mẫu mới nhất.
+            position = last.position;
+            yaw = last.yaw;
+        }
+        else if (renderTime >= last.time)
+        {
+            // Gói tin trễ: đoán trước một chút theo vận tốc, rồi đứng yên chờ gói mới.
+            position = last.position;
+            yaw = last.yaw;
+
+            float over = Mathf.Min(renderTime - last.time, Mathf.Max(0f, proxyMaxExtrapolation));
+            if (over > 0f)
+            {
+                Vector3 velocity = NetVelocity;
+                velocity.y = 0f;
+                position += velocity * over;
+            }
+        }
+        else
+        {
+            // Nội suy tuyến tính giữa 2 mẫu bao quanh renderTime.
+            NetSample s0 = netSamples[0];
+            NetSample s1 = netSamples[1];
+
+            float span = s1.time - s0.time;
+            float t = span > 0.0001f ? Mathf.Clamp01((renderTime - s0.time) / span) : 1f;
+
+            position = Vector3.Lerp(s0.position, s1.position, t);
+            yaw = Mathf.LerpAngle(s0.yaw, s1.yaw, t);
+        }
+
+        transform.SetPositionAndRotation(position, Quaternion.Euler(0f, yaw, 0f));
     }
 
     // ---------------------------------------------------------------- Camera
@@ -359,7 +624,7 @@ public class SoldierController : MonoBehaviour
         singleClickBufferUntil = -1f;
 
         FireTriggerP(reloadP);
-        PlayReloadSound();
+        RPC_PlayReload();   // phát tiếng nạp đạn trên mọi máy
         StartCoroutine(ReloadRoutine());
     }
 
@@ -395,12 +660,37 @@ public class SoldierController : MonoBehaviour
 
     private void HandleJumpInput()
     {
-        if (KeyPressedThisFrame(KeyCode.Space) && controller.isGrounded && !isReloading)
+        if (KeyPressedThisFrame(KeyCode.Space) && controller.isGrounded && !isReloading &&
+            !jumpPending && !inJump)
         {
-            verticalVelocity.y = Mathf.Sqrt(jumpHeight * -2f * gravity);
+            // Chạy animation + tiếng nhảy ngay, nhưng chờ jumpTakeoffDelay rồi mới rời khỏi mặt đất
+            // (lực nhảy thật sự được áp dụng trong MovePlayer).
+            jumpPending = true;
+            jumpTakeoffTime = Time.time + Mathf.Max(0f, jumpTakeoffDelay);
+
             FireTriggerP(jumpP);
-            PlaySfx(jumpClip, jumpVolume, 0f);
+            RPC_PlayJump();   // phát tiếng nhảy trên mọi máy
         }
+    }
+
+    // Lực nhảy ban đầu. Nếu đặt jumpAirTime thì tính để thời gian trên không đúng bằng jumpAirTime
+    // (vẫn đạt đúng jumpHeight); không thì tính theo Gravity như cũ.
+    private float GetJumpVelocity()
+    {
+        if (jumpAirTime > 0.05f)
+            return 4f * jumpHeight / jumpAirTime;
+
+        return Mathf.Sqrt(jumpHeight * -2f * gravity);
+    }
+
+    // Trọng lực dùng khi đang nhảy: nhẹ hơn nếu đặt jumpAirTime (nhảy lơ lửng, khớp animation).
+    // Rơi khỏi mép thì vẫn dùng Gravity bình thường.
+    private float GetCurrentGravity()
+    {
+        if (inJump && jumpAirTime > 0.05f)
+            return -8f * jumpHeight / (jumpAirTime * jumpAirTime);
+
+        return gravity;
     }
 
     // ---------------------------------------------------------------- Shooting
@@ -633,17 +923,17 @@ public class SoldierController : MonoBehaviour
             targetPoint = hit.point;
             Debug.DrawLine(origin, hit.point, Color.yellow, 1f);
             Debug.Log("Đã bắn trúng: " + hit.collider.name);
+
+            // TODO (sát thương): ở đây có thể kiểm tra hit.collider có script máu
+            // rồi gọi RPC gây sát thương cho chủ của đối tượng đó.
         }
         else
         {
             Debug.DrawLine(origin, targetPoint, Color.red, 1f);
         }
 
-        PlayMuzzleFlash(origin, direction);
-        PlayGunSound();
-
-        if (bulletTracerPrefab != null)
-            StartCoroutine(SpawnBulletTracer(muzzlePosition, targetPoint));
+        // Hiệu ứng (tia lửa, tiếng súng, tia đạn) chạy trên TẤT CẢ máy.
+        RPC_ShotFx(origin, direction, targetPoint, currentShootMode);
     }
 
     // Tính hướng bắn từ nòng súng (origin) tới điểm mà tâm ngắm (giữa màn hình) đang chỉ vào.
@@ -716,6 +1006,31 @@ public class SoldierController : MonoBehaviour
         return false;
     }
 
+    // ---------------------------------------------------------------- RPC (hiệu ứng chạy trên mọi máy)
+
+    // Chủ nhân vật gọi -> chạy trên tất cả máy (kể cả máy gọi).
+    [Rpc(RpcSources.StateAuthority, RpcTargets.All)]
+    public void RPC_ShotFx(Vector3 muzzlePosition, Vector3 direction, Vector3 targetPoint, int shootMode)
+    {
+        PlayMuzzleFlash(muzzlePosition, direction);
+        PlayGunSound(shootMode);
+
+        if (bulletTracerPrefab != null)
+            StartCoroutine(SpawnBulletTracer(muzzlePosition, targetPoint));
+    }
+
+    [Rpc(RpcSources.StateAuthority, RpcTargets.All)]
+    public void RPC_PlayReload()
+    {
+        PlayReloadSound();
+    }
+
+    [Rpc(RpcSources.StateAuthority, RpcTargets.All)]
+    public void RPC_PlayJump()
+    {
+        PlaySfx(jumpClip, jumpVolume, 0f);
+    }
+
     // ---------------------------------------------------------------- Movement
 
     // Đang bắn = giữ chuột trái, đang bắn loạt Burst, hoặc vừa bắn xong trong thời gian ngắn.
@@ -773,20 +1088,45 @@ public class SoldierController : MonoBehaviour
             input2D = Vector2.zero;
         }
 
-        if (controller.isGrounded && verticalVelocity.y < 0f)
+        // Đến lúc rời đất (sau khi animation nhún chân xong) thì mới áp dụng lực nhảy.
+        if (jumpPending && Time.time >= jumpTakeoffTime)
+        {
+            jumpPending = false;
+            inJump = true;
+            jumpStartTime = Time.time;
+            verticalVelocity.y = GetJumpVelocity();
+        }
+
+        // Chạm đất lại sau khi nhảy thì kết thúc trạng thái nhảy.
+        if (inJump && !jumpPending && controller.isGrounded &&
+            verticalVelocity.y <= 0f && Time.time > jumpStartTime + 0.1f)
+        {
+            inJump = false;
+        }
+
+        if (controller.isGrounded && verticalVelocity.y < 0f && !jumpPending)
             verticalVelocity.y = -2f;
 
-        verticalVelocity.y += gravity * Time.deltaTime;
+        verticalVelocity.y += GetCurrentGravity() * Time.deltaTime;
         movement.y = verticalVelocity.y;
 
+        // Di chuyển trực tiếp mỗi frame -> mượt như chơi một người, camera không bị giật.
         controller.Move(movement * Time.deltaTime);
+
+        bool grounded = controller.isGrounded;
 
         // Speed dùng cho Idle <-> Run.
         SetFloatP(speedP, input2D.magnitude);
-        SetBoolP(groundedP, controller.isGrounded);
+        SetBoolP(groundedP, grounded);
 
         // input2D đã về 0 khi đang đứng bắn nên sẽ không phát tiếng bước chân lúc đó.
-        HandleFootsteps(input2D.sqrMagnitude > 0.01f, isRunning);
+        bool isMoving = input2D.sqrMagnitude > 0.01f;
+        HandleFootsteps(isMoving, isRunning, grounded);
+
+        // Lưu lại để FixedUpdateNetwork gửi cho máy khác.
+        localMoving = isMoving;
+        localRunning = isRunning;
+        localGrounded = grounded;
 
         // Chọn hướng chính để điều khiển 4 state Walk*_Shoot_AR (chỉ khi đang ngắm).
         float moveX = 0f;
@@ -842,16 +1182,17 @@ public class SoldierController : MonoBehaviour
         Destroy(tracer.gameObject, bulletLifeTime);
     }
 
-    // Gọi hàm này từ hệ thống máu khi HP về 0.
+    // Gọi hàm này từ hệ thống máu khi HP về 0 (chỉ chạy trên máy sở hữu nhân vật).
     public void PlayDeathAnimation()
     {
-        if (isDead)
+        if (isDead || !spawned || !HasStateAuthority)
             return;
 
         isDead = true;
+        jumpPending = false;
         StopAllCoroutines();
 
-        FireTriggerP(dieP);
+        FireTriggerP(dieP);   // Trigger được NetworkMecanimAnimator gửi cho máy khác
 
         // Đặt thẳng về 0 (không damp) vì Update đã dừng chạy sau khi chết.
         SetFloatP(speedP, 0f, false);
@@ -859,6 +1200,9 @@ public class SoldierController : MonoBehaviour
         SetFloatP(moveYP, 0f, false);
         SetBoolP(aimingP, false);
         SetBoolP(isShootingP, false);
+
+        localMoving = false;
+        localRunning = false;
 
         if (reloadAudioSource != null)
             reloadAudioSource.Stop();
@@ -887,12 +1231,35 @@ public class SoldierController : MonoBehaviour
         return source;
     }
 
-    // Phát tiếng súng theo chế độ bắn hiện tại (1 = Auto, 2 = Single, 3 = Burst).
-    private void PlayGunSound()
+    // remote = true: nhân vật của người khác -> âm thanh 3D theo khoảng cách.
+    private void ConfigureAudioSpatial(bool remote)
+    {
+        ConfigureSource(gunAudioSource, remote);
+        ConfigureSource(sfxAudioSource, remote);
+        ConfigureSource(reloadAudioSource, remote);
+    }
+
+    private void ConfigureSource(AudioSource source, bool remote)
+    {
+        if (source == null)
+            return;
+
+        source.spatialBlend = remote ? 1f : 0f;
+
+        if (remote)
+        {
+            source.rolloffMode = AudioRolloffMode.Linear;
+            source.minDistance = remoteAudioMinDistance;
+            source.maxDistance = remoteAudioMaxDistance;
+        }
+    }
+
+    // Phát tiếng súng theo chế độ bắn (1 = Auto, 2 = Single, 3 = Burst).
+    private void PlayGunSound(int shootMode)
     {
         AudioClip clip;
 
-        switch (currentShootMode)
+        switch (shootMode)
         {
             case 1: clip = autoShotClip; break;
             case 2: clip = singleShotClip; break;
@@ -929,9 +1296,9 @@ public class SoldierController : MonoBehaviour
 
     // Phát tiếng bước chân đều đặn khi đang đứng trên đất và di chuyển.
     // Chạy (Shift) thì bước nhanh hơn đi bộ.
-    private void HandleFootsteps(bool isMoving, bool running)
+    private void HandleFootsteps(bool isMoving, bool running, bool grounded)
     {
-        if (!isMoving || !controller.isGrounded)
+        if (!isMoving || !grounded)
         {
             footstepTimer = 0f;   // bước đầu tiên sẽ phát ngay khi bắt đầu đi
             return;
@@ -1043,13 +1410,18 @@ public class SoldierController : MonoBehaviour
     }
 
     // Trigger: bắt buộc phải là kiểu Trigger trong Animator.
+    // Gửi qua NetworkMecanimAnimator để máy khác cũng thấy animation.
     private void FireTriggerP(AnimParam p)
     {
         if (!p.exists || p.type != AnimatorControllerParameterType.Trigger)
             return;
 
         animator.ResetTrigger(p.hash);
-        animator.SetTrigger(p.hash);
+
+        if (networkAnimator != null)
+            networkAnimator.SetTrigger(p.hash);
+        else
+            animator.SetTrigger(p.hash);
     }
 
     // ---------------------------------------------------------------- Input wrappers

@@ -4,6 +4,9 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 #endif
 
+// BẢN MULTIPLAYER: camera nằm sẵn trong scene Gameplay (tag MainCamera),
+// KHÔNG nằm trong prefab người chơi. Khi nhân vật của mình spawn xong,
+// SoldierController sẽ gọi SetTarget(transform) để camera bám theo.
 public class ThirdPersonShooterCamera : MonoBehaviour
 {
     [Header("Target")]
@@ -62,28 +65,46 @@ public class ThirdPersonShooterCamera : MonoBehaviour
     private float currentDistance;
     private bool isAiming;
     private bool cursorLocked;
+    private bool initialized;
 
     private Camera cam;
     private readonly RaycastHit[] hitBuffer = new RaycastHit[16];
 
     private void Start()
     {
-        if (target == null)
-        {
-            Debug.LogError(
-                "ThirdPersonShooterCamera: Missing Target!"
-            );
+        // Nếu Target đã được gán sẵn trong Inspector (test offline) thì khởi tạo luôn.
+        // Còn không, camera sẽ chờ tới khi SetTarget() được gọi.
+        if (target != null)
+            Initialize();
+    }
 
-            enabled = false;
-            return;
-        }
+    // Gọi từ SoldierController khi nhân vật của người chơi này được spawn.
+    public void SetTarget(Transform newTarget)
+    {
+        target = newTarget;
 
-        cam = GetComponent<Camera>();
+        if (target != null)
+            Initialize();
+    }
+
+    private void Initialize()
+    {
+        if (cam == null)
+            cam = GetComponent<Camera>();
+
         if (cam != null && adjustNearClip)
             cam.nearClipPlane = Mathf.Min(cam.nearClipPlane, Mathf.Max(0.01f, nearClip));
 
         yaw = target.eulerAngles.y;
         currentDistance = Mathf.Min(normalDistance, maxCameraDistance);
+
+        // Đặt camera về sau lưng nhân vật ngay lập tức, tránh bị "bay" từ vị trí cũ.
+        Quaternion rot = Quaternion.Euler(pitch, yaw, 0f);
+        Vector3 pivot = target.position + Vector3.up * targetHeight;
+        transform.position = pivot + rot * normalShoulderOffset - rot * Vector3.forward * currentDistance;
+        transform.rotation = rot;
+
+        initialized = true;
 
         if (lockCursorOnStart)
             SetCursorLock(true);
@@ -91,6 +112,9 @@ public class ThirdPersonShooterCamera : MonoBehaviour
 
     private void Update()
     {
+        if (!initialized || target == null)
+            return;
+
         if (EscapePressed())
         {
             SetCursorLock(!cursorLocked);
@@ -122,7 +146,7 @@ public class ThirdPersonShooterCamera : MonoBehaviour
 
     private void LateUpdate()
     {
-        if (target == null)
+        if (!initialized || target == null)
             return;
 
         Quaternion cameraRotation =
@@ -216,6 +240,7 @@ public class ThirdPersonShooterCamera : MonoBehaviour
         {
             RaycastHit hit = hitBuffer[i];
 
+            // Bỏ qua collider của nhân vật mình.
             if (hit.transform.IsChildOf(target))
                 continue;
 
